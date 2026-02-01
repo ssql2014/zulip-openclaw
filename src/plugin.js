@@ -129,6 +129,64 @@ async function zulipApi(creds, endpoint, method = 'GET', data, opts = {}) {
   return response.json();
 }
 
+/**
+ * Upload a file to Zulip and return the URL
+ * @param {object} creds - Zulip credentials
+ * @param {Buffer|string} fileContent - File content (Buffer or base64 string)
+ * @param {string} filename - Filename
+ * @returns {Promise<{ok: boolean, url?: string, error?: string}>}
+ */
+async function uploadFile(creds, fileContent, filename) {
+  const url = new URL('/api/v1/user_uploads', creds.site);
+  const auth = Buffer.from(`${creds.email}:${creds.apiKey}`).toString('base64');
+
+  // Convert base64 string to Buffer if needed
+  let buffer = fileContent;
+  if (typeof fileContent === 'string') {
+    // Handle data: URLs
+    if (fileContent.startsWith('data:')) {
+      const base64Data = fileContent.split(',')[1];
+      buffer = Buffer.from(base64Data, 'base64');
+    } else {
+      buffer = Buffer.from(fileContent, 'base64');
+    }
+  }
+
+  // Create multipart/form-data
+  const boundary = `----OpenClawZulipBoundary${Date.now()}`;
+  const formData = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+    'Content-Type: application/octet-stream',
+    '',
+    buffer.toString('binary'),
+    `--${boundary}--`,
+  ].join('\r\n');
+
+  const headers = {
+    'Authorization': `Basic ${auth}`,
+    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+  };
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: 'POST',
+      headers,
+      body: Buffer.from(formData, 'binary'),
+    });
+
+    const result = await response.json();
+    if (result.result === 'success') {
+      // Zulip returns relative URL, make it absolute
+      const uploadUrl = new URL(result.uri, creds.site).toString();
+      return { ok: true, url: uploadUrl };
+    }
+    return { ok: false, error: result.msg ?? 'Upload failed' };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 // --- Channel Plugin Definition ---
 
 const zulipPlugin = {
@@ -229,10 +287,28 @@ const zulipPlugin = {
       return { channel: 'zulip-openclaw', ok: false, error: result.msg };
     },
 
-    sendMedia: async ({ to, text, mediaUrl, accountId, cfg, replyToId }) => {
-      // TODO: Upload file to Zulip, then send message with attachment link
-      // For now, send text with media URL
-      const content = text ? `${text}\n${mediaUrl}` : mediaUrl;
+    sendMedia: async ({ to, text, mediaUrl, mediaBuffer, filename, accountId, cfg, replyToId }) => {
+      const account = zulipPlugin.config.resolveAccount(cfg, accountId);
+      if (!account) return { ok: false, error: 'No Zulip account configured' };
+
+      const creds = { email: account.email, apiKey: account.apiKey, site: account.site };
+
+      // If we have mediaBuffer or base64 data, upload it
+      let finalUrl = mediaUrl;
+      if (mediaBuffer || (typeof mediaUrl === 'string' && mediaUrl.startsWith('data:'))) {
+        const uploadResult = await uploadFile(
+          creds,
+          mediaBuffer ?? mediaUrl,
+          filename ?? 'file.bin'
+        );
+        if (!uploadResult.ok) {
+          return { channel: 'zulip-openclaw', ok: false, error: uploadResult.error };
+        }
+        finalUrl = uploadResult.url;
+      }
+
+      // Build message content with uploaded file
+      const content = text ? `${text}\n${finalUrl}` : finalUrl;
       return zulipPlugin.outbound.sendText({ to, text: content, accountId, cfg, replyToId });
     },
   },
@@ -241,7 +317,7 @@ const zulipPlugin = {
     listActions: ({ cfg }) => {
       const accounts = zulipPlugin.config.listAccountIds(cfg);
       if (accounts.length === 0) return [];
-      return ['send', 'react', 'reactions', 'read', 'edit', 'delete'];
+      return ['send', 'upload', 'react', 'reactions', 'read', 'edit', 'delete'];
     },
 
     handleAction: async ({ action, params, cfg, accountId }) => {
@@ -343,6 +419,18 @@ const zulipPlugin = {
         const messageId = params.messageId;
         const result = await zulipApi(creds, `/messages/${messageId}`, 'DELETE');
         return { ok: result.result === 'success', error: result.msg };
+      }
+
+      if (action === 'upload') {
+        const buffer = params.buffer ?? params.content;
+        const filename = params.filename ?? 'file.bin';
+        
+        if (!buffer) {
+          return { ok: false, error: 'No file content provided (buffer or content)' };
+        }
+
+        const uploadResult = await uploadFile(creds, buffer, filename);
+        return uploadResult;
       }
 
       return { error: `Unsupported action: ${action}` };
@@ -585,4 +673,4 @@ const zulipPlugin = {
 
 // --- Export & Registration ---
 
-module.exports = { zulipPlugin, zulipApi, loadCredentials, setPluginRuntime };
+module.exports = { zulipPlugin, zulipApi, uploadFile, loadCredentials, setPluginRuntime };

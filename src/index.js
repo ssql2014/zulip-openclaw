@@ -4,7 +4,7 @@
  * Registers the Zulip channel plugin, tools, and services with OpenClaw.
  */
 
-const { zulipPlugin, loadCredentials, zulipApi, setPluginRuntime } = require('./plugin.js');
+const { zulipPlugin, loadCredentials, zulipApi, uploadFile, setPluginRuntime } = require('./plugin.js');
 
 function jsonResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -119,6 +119,26 @@ function register(api) {
         return jsonResult({ ok: false, error: result.msg ?? 'Unknown error' });
       },
     }, { name: 'zulip_react' });
+
+    api.registerTool({
+      name: 'zulip_upload',
+      description: 'Upload a file or image to Zulip and get the URL',
+      parameters: {
+        type: 'object',
+        properties: {
+          buffer: { type: 'string', description: 'Base64-encoded file content or data: URL' },
+          filename: { type: 'string', description: 'Filename (e.g., image.png)' },
+        },
+        required: ['buffer', 'filename'],
+      },
+      execute: async (toolCallId, params) => {
+        const creds = loadCredentials();
+        if (!creds) return jsonResult({ error: 'No Zulip credentials configured' });
+
+        const result = await uploadFile(creds, params.buffer, params.filename);
+        return jsonResult(result);
+      },
+    }, { name: 'zulip_upload' });
   }
 
   logger.info('[zulip] Plugin registered');
